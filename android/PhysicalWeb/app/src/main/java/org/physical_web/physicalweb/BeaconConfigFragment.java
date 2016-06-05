@@ -16,6 +16,10 @@
 
 package org.physical_web.physicalweb;
 
+import org.physical_web.collection.PwsClient;
+import org.physical_web.collection.PwsResult;
+import org.physical_web.collection.PwsResultCallback;
+
 import android.app.Fragment;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
@@ -55,6 +59,7 @@ import org.uribeacon.scan.util.RegionResolver;
 
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
@@ -171,7 +176,7 @@ public class BeaconConfigFragment extends Fragment implements TextView.OnEditorA
     super.onPause();
     mScanningAnimation.stop();
     scanLeDevice(false);
-    PwsClient.getInstance(getActivity()).cancelAllRequests(TAG);
+    UrlShortenerClient.getInstance(getActivity()).cancelAllRequests(TAG);
     if (mUriBeaconConfig != null) {
       mUriBeaconConfig.closeUriBeacon();
     }
@@ -256,22 +261,33 @@ public class BeaconConfigFragment extends Fragment implements TextView.OnEditorA
     Log.d(TAG, "onReadUrlComplete" + "  url:  " + url);
     if (!isShortUrl(url)) {
       setEditCardUrl(url);
+      return;
     }
 
-    // Create the callback object to set the url
-    PwsClient.ResolveScanCallback resolveScanCallback = new PwsClient.ResolveScanCallback() {
-      @Override
-      public void onUrlMetadataReceived(PwoMetadata pwoMetadata){
-        setEditCardUrl(pwoMetadata.urlMetadata.siteUrl);
+
+    PwsClient pwsClient = new PwsClient();
+    Utils.setPwsEndpoint(getActivity(), pwsClient);
+    // Populate the field with a URL.
+    pwsClient.resolve(Arrays.asList(url), new PwsResultCallback() {
+      public void runSetEditCardUrlOnUiThread(final String url){
+        getActivity().runOnUiThread(new Runnable(){
+          @Override
+          public void run() {
+            setEditCardUrl(url);
+          }
+        });
       }
 
       @Override
-      public void onUrlMetadataAbsent(PwoMetadata pwoMetadata){
-        setEditCardUrl(url);
+      public void onPwsResult(PwsResult pwsResult) {
+        runSetEditCardUrlOnUiThread(pwsResult.getSiteUrl());
       }
-    };
-    PwoMetadata pwoMetadata = new PwoMetadata(url, 0);
-    PwsClient.getInstance(getActivity()).findUrlMetadata(pwoMetadata, resolveScanCallback, TAG);
+
+      @Override
+      public void onPwsResultAbsent(String url) {
+        runSetEditCardUrlOnUiThread(url);
+      }
+    });
   }
 
   public void onBeaconConfigWriteUrlComplete(final int status) {
@@ -406,7 +422,7 @@ public class BeaconConfigFragment extends Fragment implements TextView.OnEditorA
       url = "http://" + url;
     }
     // Create the callback object to set the url
-    PwsClient.ShortenUrlCallback urlSetter = new PwsClient.ShortenUrlCallback() {
+    UrlShortenerClient.ShortenUrlCallback urlSetter = new UrlShortenerClient.ShortenUrlCallback() {
       @Override
       public void onUrlShortened(String newUrl) {
         setUriBeaconUrl(newUrl);
@@ -427,7 +443,7 @@ public class BeaconConfigFragment extends Fragment implements TextView.OnEditorA
       setUriBeaconUrl(url);
     } else {
       // Shorten the url if necessary
-      PwsClient.getInstance(getActivity()).shortenUrl(url, urlSetter, TAG);
+      UrlShortenerClient.getInstance(getActivity()).shortenUrl(url, urlSetter, TAG);
     }
   }
 

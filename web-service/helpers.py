@@ -36,10 +36,11 @@ import lxml.etree
 ENABLE_EXPERIMENTAL = app_identity.get_application_id().endswith('-dev')
 PHYSICAL_WEB_USER_AGENT = 'Mozilla/5.0' # TODO: Find a more descriptive string.
 BASE_URL = 'https://' + app_identity.get_application_id() + '.appspot.com'
+DEFAULT_SECURE_ONLY = False
 
 ################################################################################
 
-def BuildResponse(objects):
+def BuildResponse(objects, secure_only):
     metadata_output = []
     unresolved_output = []
 
@@ -79,6 +80,10 @@ def BuildResponse(objects):
         if fragment == '':
             fragment = parsed_url.fragment
         finalUrl = urlunsplit((scheme, netloc, path, query, fragment))
+
+        if secure_only and scheme != 'https':
+            append_invalid()
+            continue
 
         device_data = {}
         device_data['id'] = url
@@ -280,23 +285,26 @@ def StoreUrl(siteInfo, url, content, encoding):
     parser = lxml.etree.HTMLParser(encoding=encoding)
     htmltree = lxml.etree.fromstring(content, parser)
 
-    # Try to find web manifest <link rel="manifest" href="...">.
-    value = htmltree.xpath("//link[@rel='manifest']/attribute::href")
-    if (len(value) > 0):
-        # Fetch web manifest.
-        manifestUrl = value[0]
-        if "://" not in manifestUrl:
-            manifestUrl = urljoin(url, manifestUrl)
-        try:
-            result = urlfetch.fetch(manifestUrl)
-            if result.status_code == 200:
-                manifestData = json.loads(result.content)
-                if 'short_name' in manifestData:
-                    title = manifestData['short_name']
-                else:
-                    title = manifestData['name']
-        except:
-            pass
+    # TODO(mmocny): Removing until we test for URL == manifestData['start_url']
+    # ..will need to adjust to site root.
+    #
+    ## Try to find web manifest <link rel="manifest" href="...">
+    #value = htmltree.xpath("//link[@rel='manifest']/attribute::href")
+    #if (len(value) > 0):
+    #    # Fetch web manifest.
+    #    manifestUrl = value[0]
+    #    if "://" not in manifestUrl:
+    #        manifestUrl = urljoin(url, manifestUrl)
+    #    try:
+    #        result = urlfetch.fetch(manifestUrl)
+    #        if result.status_code == 200:
+    #            manifestData = json.loads(result.content)
+    #            if 'short_name' in manifestData:
+    #                title = manifestData['short_name']
+    #            else:
+    #                title = manifestData['name']
+    #    except:
+    #        pass
 
     # Try to use <title>...</title>.
     if title is None:
