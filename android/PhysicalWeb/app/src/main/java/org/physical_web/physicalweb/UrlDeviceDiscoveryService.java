@@ -27,7 +27,6 @@ import org.physical_web.collection.UrlDevice;
 import android.app.Notification;
 import android.app.PendingIntent;
 import android.app.Service;
-import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.res.Resources;
@@ -36,9 +35,9 @@ import android.os.Binder;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
+import android.preference.PreferenceManager;
 import android.support.v4.app.NotificationCompat;
 import android.support.v4.app.NotificationManagerCompat;
-import android.util.Log;
 import android.view.View;
 import android.widget.RemoteViews;
 
@@ -68,7 +67,7 @@ import java.util.concurrent.TimeUnit;
 public class UrlDeviceDiscoveryService extends Service
                                        implements UrlDeviceDiscoverer.UrlDeviceDiscoveryCallback {
 
-  private static final String TAG = "UrlDeviceDiscoveryService";
+  private static final String TAG = UrlDeviceDiscoveryService.class.getSimpleName();
   private static final String NOTIFICATION_GROUP_KEY = "URI_BEACON_NOTIFICATIONS";
   private static final String PREFS_VERSION_KEY = "prefs_version";
   private static final String SCAN_START_TIME_KEY = "scan_start_time";
@@ -80,11 +79,11 @@ public class UrlDeviceDiscoveryService extends Service
   private static final int NON_LOLLIPOP_NOTIFICATION_TITLE_COLOR = Color.parseColor("#ffffff");
   private static final int NON_LOLLIPOP_NOTIFICATION_URL_COLOR = Color.parseColor("#999999");
   private static final int NON_LOLLIPOP_NOTIFICATION_SNIPPET_COLOR = Color.parseColor("#999999");
-  private static final int NOTIFICATION_PRIORITY = NotificationCompat.PRIORITY_MIN;
   private static final int NOTIFICATION_VISIBILITY = NotificationCompat.VISIBILITY_PUBLIC;
   private static final long FIRST_SCAN_TIME_MILLIS = TimeUnit.SECONDS.toMillis(2);
   private static final long SECOND_SCAN_TIME_MILLIS = TimeUnit.SECONDS.toMillis(10);
   private static final long SCAN_STALE_TIME_MILLIS = TimeUnit.MINUTES.toMillis(2);
+  private static final long LOCAL_SCAN_STALE_TIME_MILLIS = TimeUnit.SECONDS.toMillis(30);
   private boolean mCanUpdateNotifications = false;
   private boolean mSecondScanComplete = false;
   private boolean mIsBound = false;
@@ -143,9 +142,13 @@ public class UrlDeviceDiscoveryService extends Service
     mNotificationManager = NotificationManagerCompat.from(this);
     mUrlDeviceDiscoverers = new ArrayList<>();
 
-    // disable mDNS PWO discovery for pre-M devices
-    if (Build.VERSION.SDK_INT > Build.VERSION_CODES.LOLLIPOP) {
+    if (Utils.isMdnsEnabled(this)) {
+      Log.d(TAG, "mdns started");
       mUrlDeviceDiscoverers.add(new MdnsUrlDeviceDiscoverer(this));
+    }
+    if (Utils.isWifiDirectEnabled(this)) {
+      Log.d(TAG, "wifi direct started");
+      mUrlDeviceDiscoverers.add(new WifiUrlDeviceDiscoverer(this));
     }
     mUrlDeviceDiscoverers.add(new SsdpUrlDeviceDiscoverer(this));
     mUrlDeviceDiscoverers.add(new BleUrlDeviceDiscoverer(this));
@@ -155,14 +158,15 @@ public class UrlDeviceDiscoveryService extends Service
     mUrlDeviceDiscoveryListeners = new ArrayList<>();
     mHandler = new Handler();
     mPwCollection = new PhysicalWebCollection();
-    Utils.setPwsEndpoint(this, mPwCollection);
+    if (!Utils.setPwsEndpoint(this, mPwCollection)) {
+      Utils.warnUserOnMissingApiKey(this);
+    }
     mCanUpdateNotifications = false;
   }
 
   private void restoreCache() {
     // Make sure we are trying to load the right version of the cache
-    String preferencesKey = getString(R.string.discovery_service_prefs_key);
-    SharedPreferences prefs = getSharedPreferences(preferencesKey, Context.MODE_PRIVATE);
+    SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(this);
     int prefsVersion = prefs.getInt(PREFS_VERSION_KEY, 0);
     long now = new Date().getTime();
     if (prefsVersion != PREFS_VERSION) {
@@ -172,7 +176,8 @@ public class UrlDeviceDiscoveryService extends Service
 
     // Don't load the cache if it's stale
     mScanStartTime = prefs.getLong(SCAN_START_TIME_KEY, 0);
-    if (now - mScanStartTime >= SCAN_STALE_TIME_MILLIS) {
+    long scanDelta = now - mScanStartTime;
+    if (scanDelta >= SCAN_STALE_TIME_MILLIS) {
       mScanStartTime = now;
       return;
     }
@@ -187,6 +192,22 @@ public class UrlDeviceDiscoveryService extends Service
     } catch (PhysicalWebCollectionException e) {
       Log.e(TAG, "Could not restore Physical Web collection cache", e);
     }
+    // replace TxPower and RSSI data after restoring cache
+    for (UrlDevice urlDevice : mPwCollection.getUrlDevices()) {
+      if (Utils.isBleUrlDevice(urlDevice)) {
+        Utils.updateRegion(urlDevice);
+      }
+    }
+    // Unresolvable devices are typically not
+    // relevant outside of scan range. Hence,
+    // we specially clean them from the cache.
+    if (scanDelta >= LOCAL_SCAN_STALE_TIME_MILLIS) {
+      for (UrlDevice urlDevice : mPwCollection.getUrlDevices()) {
+        if (!Utils.isResolvableDevice(urlDevice)) {
+          mPwCollection.removeUrlDevice(urlDevice);
+        }
+      }
+    }
   }
 
   @Override
@@ -194,13 +215,15 @@ public class UrlDeviceDiscoveryService extends Service
     super.onCreate();
     initialize();
     restoreCache();
-
     cancelNotifications();
     mHandler.postDelayed(mFirstScanTimeout, FIRST_SCAN_TIME_MILLIS);
     mHandler.postDelayed(mSecondScanTimeout, SECOND_SCAN_TIME_MILLIS);
-    for (UrlDeviceDiscoverer urlDeviceDiscoverer : mUrlDeviceDiscoverers) {
-      urlDeviceDiscoverer.startScan();
-    }
+  }
+
+  @Override
+  public int onStartCommand(Intent intent, int flags, int startId) {
+    startScan();
+    return START_STICKY;
   }
 
   @Override
@@ -231,13 +254,11 @@ public class UrlDeviceDiscoveryService extends Service
 
   private void saveCache() {
     // Write the PW Collection
-    String preferencesKey = getString(R.string.discovery_service_prefs_key);
-    SharedPreferences prefs = getSharedPreferences(preferencesKey, Context.MODE_PRIVATE);
-    SharedPreferences.Editor editor = prefs.edit();
-    editor.putInt(PREFS_VERSION_KEY, PREFS_VERSION);
-    editor.putLong(SCAN_START_TIME_KEY, mScanStartTime);
-    editor.putString(PW_COLLECTION_KEY, mPwCollection.jsonSerialize().toString());
-    editor.apply();
+    PreferenceManager.getDefaultSharedPreferences(this).edit()
+        .putInt(PREFS_VERSION_KEY, PREFS_VERSION)
+        .putLong(SCAN_START_TIME_KEY, mScanStartTime)
+        .putString(PW_COLLECTION_KEY, mPwCollection.jsonSerialize().toString())
+        .apply();
   }
 
   @Override
@@ -247,17 +268,24 @@ public class UrlDeviceDiscoveryService extends Service
     // Stop the scanners
     mHandler.removeCallbacks(mFirstScanTimeout);
     mHandler.removeCallbacks(mSecondScanTimeout);
-    for (UrlDeviceDiscoverer urlDeviceDiscoverer : mUrlDeviceDiscoverers) {
-      urlDeviceDiscoverer.stopScan();
-    }
-
+    stopScan();
     saveCache();
     super.onDestroy();
   }
 
   @Override
   public void onUrlDeviceDiscovered(UrlDevice urlDevice) {
+    // Add Device and fetch results
+    // Don't short circuit because icons
+    // and metadata may not be fetched
     mPwCollection.addUrlDevice(urlDevice);
+    Log.d(TAG, urlDevice.getUrl());
+    if (!Utils.isResolvableDevice(urlDevice)) {
+      mPwCollection.addMetadata(new PwsResult.Builder(urlDevice.getUrl(), urlDevice.getUrl())
+        .setTitle(Utils.getTitle(urlDevice))
+        .setDescription(Utils.getDescription(urlDevice))
+        .build());
+    }
     mPwCollection.fetchPwsResults(new PwsResultCallback() {
       long mPwsTripTimeMillis = 0;
 
@@ -315,23 +343,32 @@ public class UrlDeviceDiscoveryService extends Service
       return;
     }
 
-    List<PwPair> pwPairs = mPwCollection.getGroupedPwPairsSortedByRank();
+    List<PwPair> pwPairs = mPwCollection.getGroupedPwPairsSortedByRank(
+        new Utils.PwPairRelevanceComparator());
+    List<PwPair> notBlockedPwPairs = new ArrayList<>();
+    for (PwPair i : pwPairs) {
+      if (!Utils.isBlocked(i)) {
+        notBlockedPwPairs.add(i);
+      }
+    }
+
 
     // If no beacons have been found
-    if (pwPairs.size() == 0) {
+    if (notBlockedPwPairs.size() == 0) {
       // Remove all existing notifications
       cancelNotifications();
-    } else if (pwPairs.size() == 1) {
-      updateNearbyBeaconNotification(true, pwPairs.get(0), NEAREST_BEACON_NOTIFICATION_ID);
+    } else if (notBlockedPwPairs.size() == 1) {
+      updateNearbyBeaconNotification(true, notBlockedPwPairs.get(0),
+          NEAREST_BEACON_NOTIFICATION_ID);
     } else {
       // Create a summary notification for both beacon notifications.
       // Do this first so that we don't first show the individual notifications
-      updateSummaryNotification(pwPairs);
+      updateSummaryNotification(notBlockedPwPairs);
       // Create or update a notification for second beacon
-      updateNearbyBeaconNotification(false, pwPairs.get(1),
+      updateNearbyBeaconNotification(false, notBlockedPwPairs.get(1),
                                      SECOND_NEAREST_BEACON_NOTIFICATION_ID);
       // Create or update a notification for first beacon. Needs to be added last to show up top
-      updateNearbyBeaconNotification(false, pwPairs.get(0),
+      updateNearbyBeaconNotification(false, notBlockedPwPairs.get(0),
                                      NEAREST_BEACON_NOTIFICATION_ID);
 
     }
@@ -342,13 +379,37 @@ public class UrlDeviceDiscoveryService extends Service
    */
   private void updateNearbyBeaconNotification(boolean single, PwPair pwPair, int notificationId) {
     PwsResult pwsResult = pwPair.getPwsResult();
+    UrlDevice urlDevice = pwPair.getUrlDevice();
     NotificationCompat.Builder builder = new NotificationCompat.Builder(this);
     builder.setSmallIcon(R.drawable.ic_notification)
         .setLargeIcon(Utils.getBitmapIcon(mPwCollection, pwsResult))
         .setContentTitle(pwsResult.getTitle())
         .setContentText(pwsResult.getDescription())
-        .setPriority(NOTIFICATION_PRIORITY)
-        .setContentIntent(Utils.createNavigateToUrlPendingIntent(pwsResult, this));
+        .setPriority((Utils.isFavorite(pwPair.getPwsResult().getSiteUrl()))
+            ? NotificationCompat.PRIORITY_DEFAULT : NotificationCompat.PRIORITY_MIN);
+    if (Utils.isFatBeaconDevice(urlDevice)) {
+      Intent intent = new Intent(this, OfflineTransportConnectionActivity.class);
+      intent.putExtra(OfflineTransportConnectionActivity.EXTRA_CONNECTION_TYPE,
+          OfflineTransportConnectionActivity.EXTRA_FAT_BEACON_CONNECTION);
+      intent.putExtra(OfflineTransportConnectionActivity.EXTRA_DEVICE_ADDRESS,
+          pwsResult.getSiteUrl());
+      intent.putExtra(OfflineTransportConnectionActivity.EXTRA_PAGE_TITLE, pwsResult.getTitle());
+      int requestID = (int) System.currentTimeMillis();
+      builder.setContentIntent(PendingIntent.getActivity(this, requestID, intent, 0));
+    } else if (Utils.isWifiDirectDevice(urlDevice)) {
+      Intent intent = new Intent(this, OfflineTransportConnectionActivity.class);
+      intent.putExtra(OfflineTransportConnectionActivity.EXTRA_CONNECTION_TYPE,
+          OfflineTransportConnectionActivity.EXTRA_WIFI_DIRECT_CONNECTION);
+      intent.putExtra(OfflineTransportConnectionActivity.EXTRA_DEVICE_ADDRESS,
+          Utils.getWifiAddress(urlDevice));
+      intent.putExtra(OfflineTransportConnectionActivity.EXTRA_PAGE_TITLE, pwsResult.getTitle());
+      intent.putExtra(OfflineTransportConnectionActivity.EXTRA_DEVICE_PORT,
+          Utils.getWifiPort(urlDevice));
+      int requestID = (int) System.currentTimeMillis();
+      builder.setContentIntent(PendingIntent.getActivity(this, requestID, intent, 0));
+    } else {
+      builder.setContentIntent(Utils.createNavigateToUrlPendingIntent(pwsResult, this));
+    }
     if (android.os.Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP
         && Utils.isPublic(pwPair.getUrlDevice())) {
       builder.setVisibility(NOTIFICATION_VISIBILITY);
@@ -381,7 +442,8 @@ public class UrlDeviceDiscoveryService extends Service
         .setSmallIcon(R.drawable.ic_notification)
         .setGroup(NOTIFICATION_GROUP_KEY)
         .setGroupSummary(true)
-        .setPriority(NOTIFICATION_PRIORITY)
+        .setPriority(Utils.containsFavorite(pwPairs)
+            ? NotificationCompat.PRIORITY_DEFAULT : NotificationCompat.PRIORITY_MIN)
         .setContentIntent(createReturnToAppPendingIntent());
     if (android.os.Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
       builder.setVisibility(NOTIFICATION_VISIBILITY);
@@ -478,21 +540,42 @@ public class UrlDeviceDiscoveryService extends Service
     return mScanStartTime;
   }
 
-  public void restartScan() {
-    for (UrlDeviceDiscoverer urlDeviceDiscoverer : mUrlDeviceDiscoverers) {
-      urlDeviceDiscoverer.stopScan();
-    }
-    mScanStartTime = new Date().getTime();
+  private void startScan() {
     for (UrlDeviceDiscoverer urlDeviceDiscoverer : mUrlDeviceDiscoverers) {
       urlDeviceDiscoverer.startScan();
     }
   }
 
+  private void stopScan() {
+    for (UrlDeviceDiscoverer urlDeviceDiscoverer : mUrlDeviceDiscoverers) {
+      urlDeviceDiscoverer.stopScan();
+    }
+  }
+
+  public void restartScan() {
+    stopScan();
+    mScanStartTime = new Date().getTime();
+    startScan();
+  }
+
   public boolean hasResults() {
-    return !mPwCollection.getGroupedPwPairsSortedByRank().isEmpty();
+    return !mPwCollection.getPwPairs().isEmpty();
   }
 
   public PhysicalWebCollection getPwCollection() {
     return mPwCollection;
+  }
+
+  public void clearCache() {
+    stopScan();
+    mScanStartTime = new Date().getTime();
+    Utils.setPwsEndpoint(this, mPwCollection);
+    mPwCollection.clear();
+    saveCache();
+  }
+
+  public void newPwsStartScan() {
+    Utils.setPwsEndpoint(this, mPwCollection);
+    restartScan();
   }
 }

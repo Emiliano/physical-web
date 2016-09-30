@@ -16,10 +16,12 @@
 
 package org.physical_web.physicalweb;
 
+import org.physical_web.collection.PwsClient;
+import org.physical_web.collection.PwsResult;
+import org.physical_web.collection.PwsResultCallback;
+import org.physical_web.physicalweb.ble.AdvertiseDataUtils;
 
 import android.annotation.TargetApi;
-import android.app.NotificationManager;
-import android.app.PendingIntent;
 import android.app.Service;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothManager;
@@ -31,36 +33,37 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.SharedPreferences;
 import android.os.Handler;
 import android.os.IBinder;
-import android.support.v4.app.NotificationCompat;
+import android.preference.PreferenceManager;
 import android.support.v4.app.NotificationManagerCompat;
-import android.support.v4.app.TaskStackBuilder;
-import android.util.Log;
 import android.widget.Toast;
-import org.physical_web.physicalweb.ble.AdvertiseDataUtils;
-import org.physical_web.physicalweb.ble.UriBeacon;
 
 import java.net.URI;
 import java.net.URISyntaxException;
-/**
-  * Shares URLs via bluetooth.
-  * Also interfaces with PWS to shorten URLs that are too long for Eddystone URLs.
-  * Lastly, it surfaces a persistent notification whenever a URL is currently being broadcast.
-**/
+import java.util.Arrays;
+import java.util.Collection;
 
+/**
+ * Shares URLs via bluetooth.
+ * Also interfaces with PWS to shorten URLs that are too long for Eddystone URLs.
+ * Lastly, it surfaces a persistent notification whenever a URL is currently being broadcast.
+ **/
 @TargetApi(21)
 public class PhysicalWebBroadcastService extends Service {
 
-    private static final String TAG = "PhysicalWebBroadcastService";
+    private static final String TAG = PhysicalWebBroadcastService.class.getSimpleName();
     private BluetoothLeAdvertiser mBluetoothLeAdvertiser;
     private static final int BROADCASTING_NOTIFICATION_ID = 6;
     public static final String DISPLAY_URL_KEY = "displayUrl";
+    public static final String PREVIOUS_BROADCAST_URL_KEY = "previousUrl";
     public static final int MAX_URI_LENGTH = 18;
     private NotificationManagerCompat mNotificationManager;
     private Handler mHandler = new Handler();
     private String mDisplayUrl;
-    private String mShareUrl;
+    private byte[] mShareUrl;
+    private boolean mStartedByRestart;
 
     private final BroadcastReceiver mReceiver = new BroadcastReceiver() {
         @Override
@@ -98,42 +101,95 @@ public class PhysicalWebBroadcastService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        Log.d(TAG, "SERVICE onStartCommand");
-        IntentFilter filter = new IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED);
-        registerReceiver(mReceiver, filter);
-        mDisplayUrl = intent.getStringExtra(DISPLAY_URL_KEY);
-        Log.d(TAG, mDisplayUrl);
-
-        if (hasValidUrlLength(mDisplayUrl) && checkAndHandleAsciiUrl(mDisplayUrl)) {
-            // Set the url if we can
-            Log.d(TAG, "valid length");
-            mShareUrl = mDisplayUrl;
-            broadcastUrl();
-        } else {
-            Log.d(TAG, "needs shortening");
-            // Shorten the url if necessary
-            UrlShortenerClient.ShortenUrlCallback urlSetter =
-            new UrlShortenerClient.ShortenUrlCallback() {
-                @Override
-                public void onUrlShortened(String newUrl) {
-                    Log.d(TAG, "shortening success");
-                    mShareUrl = newUrl;
-                    broadcastUrl();
-                }
-                @Override
-                public void onError(String oldUrl) {
-                    Toast.makeText(getApplicationContext(), getString(R.string.shorten_error),
-                        Toast.LENGTH_LONG).show();
-                }
-            };
-            UrlShortenerClient.getInstance(this).shortenUrl(mDisplayUrl, urlSetter, TAG);
-        }
-        // Keep the service running
+      fetchBroadcastData(intent);
+      if (mDisplayUrl == null) {
+        stopSelf();
         return START_STICKY;
+      }
+      Log.d(TAG, "SERVICE onStartCommand");
+      IntentFilter filter = new IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED);
+      registerReceiver(mReceiver, filter);
+
+      Log.d(TAG, mDisplayUrl);
+      byte[] encodedUrl = AdvertiseDataUtils.encodeUri(mDisplayUrl);
+      if (hasValidUrlLength(encodedUrl.length) && checkAndHandleAsciiUrl(mDisplayUrl)) {
+        // Set the url if we can
+        Log.d(TAG, "valid length");
+        mShareUrl = encodedUrl;
+        broadcastUrl();
+      } else {
+        Log.d(TAG, "needs shortening");
+        UrlShortenerClient.ShortenUrlCallback urlSetter =
+            new UrlShortenerClient.ShortenUrlCallback() {
+          @Override
+          public void onUrlShortened(String newUrl) {
+            Log.d(TAG, "shortening success");
+            mShareUrl = AdvertiseDataUtils.encodeUri(newUrl);
+            broadcastUrl();
+          }
+          @Override
+          public void onError(String oldUrl) {
+            Toast.makeText(getApplicationContext(), getString(R.string.shorten_error),
+                Toast.LENGTH_LONG).show();
+            stopSelf();
+          }
+        };
+        UrlShortenerClient shortenerClient = UrlShortenerClient.getInstance(this);
+
+        if (mDisplayUrl.contains("goo.gl")) {
+          // find the site URL and reshorten it since
+          // goo.gl will not reshorten other goo.gl links
+          fetchAndShorten(shortenerClient, urlSetter);
+        } else {
+          shortenerClient.shortenUrl(mDisplayUrl, urlSetter, TAG);
+        }
+      }
+      return START_STICKY;
     }
 
-    private static boolean hasValidUrlLength(String url) {
-        int uriLength = UriBeacon.uriLength(url);
+    private void fetchAndShorten(UrlShortenerClient shortenerClient,
+        UrlShortenerClient.ShortenUrlCallback urlSetter) {
+      PwsClient pwsClient = new PwsClient();
+      pwsClient.resolve(Arrays.asList(mDisplayUrl), new PwsResultCallback() {
+        @Override
+        public void onPwsResult(PwsResult pwsResult) {
+          shortenerClient.shortenUrl(pwsResult.getSiteUrl(), urlSetter, TAG);
+        }
+
+        @Override
+        public void onPwsResultAbsent(String url) {
+          Toast.makeText(getApplicationContext(), getString(R.string.shorten_error),
+              Toast.LENGTH_LONG).show();
+          stopSelf();
+        }
+
+        @Override
+        public void onPwsResultError(Collection<String> urls, int httpResponseCode, Exception e) {
+          Toast.makeText(getApplicationContext(), getString(R.string.shorten_error),
+              Toast.LENGTH_LONG).show();
+          stopSelf();
+        }
+
+        @Override
+        public void onResponseReceived(long durationMillis) {
+        }
+      });
+    }
+
+    private void fetchBroadcastData(Intent intent) {
+        mStartedByRestart = intent == null;
+        if (intent == null) {
+            SharedPreferences sharedPrefs = PreferenceManager.getDefaultSharedPreferences(this);
+            mDisplayUrl = sharedPrefs.getString(PREVIOUS_BROADCAST_URL_KEY, null);
+            return;
+        }
+        mDisplayUrl = intent.getStringExtra(DISPLAY_URL_KEY);
+        PreferenceManager.getDefaultSharedPreferences(this).edit()
+            .putString(PREVIOUS_BROADCAST_URL_KEY, mDisplayUrl)
+            .commit();
+    }
+
+    private static boolean hasValidUrlLength(int uriLength) {
         return 0 < uriLength && uriLength <= MAX_URI_LENGTH;
     }
 
@@ -158,13 +214,6 @@ public class PhysicalWebBroadcastService extends Service {
         super.onDestroy();
     }
 
-    // Fires when user swipes away app from the recent apps list
-    @Override
-    public void onTaskRemoved (Intent rootIntent) {
-        Log.d(TAG, "onTaskRemoved");
-        stopSelf();
-    }
-
     @Override
     public IBinder onBind(Intent intent) {
         return null;
@@ -177,9 +226,13 @@ public class PhysicalWebBroadcastService extends Service {
         @Override
         public void onStartSuccess(AdvertiseSettings advertiseSettings) {
             Log.d(TAG, "URL is broadcasting");
-            createNotification();
-            Toast.makeText(getApplicationContext(), getString(R.string.url_broadcast),
-                Toast.LENGTH_LONG).show();
+            Utils.createBroadcastNotification(PhysicalWebBroadcastService.this, stopServiceReceiver,
+                BROADCASTING_NOTIFICATION_ID, getString(R.string.broadcast_notif), mDisplayUrl,
+                "myFilter");
+            if (!mStartedByRestart) {
+                Toast.makeText(getApplicationContext(), getString(R.string.url_broadcast),
+                    Toast.LENGTH_LONG).show();
+            }
         }
 
         // Fires when the URL could not be advertised
@@ -197,9 +250,8 @@ public class PhysicalWebBroadcastService extends Service {
 
     // Broadcast via bluetooth the stored URL
     private void broadcastUrl() {
-        Log.d(TAG, "broadcastUrl: " + mShareUrl);
         final AdvertiseData advertisementData = AdvertiseDataUtils.getAdvertisementData(mShareUrl);
-        final AdvertiseSettings advertiseSettings = AdvertiseDataUtils.getAdvertiseSettings();
+        final AdvertiseSettings advertiseSettings = AdvertiseDataUtils.getAdvertiseSettings(false);
         mBluetoothLeAdvertiser.stopAdvertising(mAdvertiseCallback);
         mBluetoothLeAdvertiser.startAdvertising(advertiseSettings,
             advertisementData, mAdvertiseCallback);
@@ -210,36 +262,6 @@ public class PhysicalWebBroadcastService extends Service {
         Log.d(TAG, "disableUrlBroadcasting");
         mBluetoothLeAdvertiser.stopAdvertising(mAdvertiseCallback);
         mNotificationManager.cancel(BROADCASTING_NOTIFICATION_ID);
-    }
-
-
-
-    // Surface a notification to the user that a URL is being broadcast
-    // The notification specifies the URL being broadcast (the long URL)
-    // and cannot be swiped away
-    private void createNotification() {
-                //.setPriority(NotificationCompat.PRIORITY_MIN);
-        Intent resultIntent = new Intent();
-        TaskStackBuilder stackBuilder = TaskStackBuilder.create(this);
-        stackBuilder.addParentStack(BroadcastActivity.class);
-        stackBuilder.addNextIntent(resultIntent);
-        PendingIntent resultPendingIntent = stackBuilder.getPendingIntent(0,
-            PendingIntent.FLAG_UPDATE_CURRENT);
-        registerReceiver(stopServiceReceiver, new IntentFilter("myFilter"));
-        PendingIntent pIntent = PendingIntent.getBroadcast(this, 0, new Intent("myFilter"),
-            PendingIntent.FLAG_UPDATE_CURRENT);
-        NotificationCompat.Builder mBuilder = new NotificationCompat.Builder(this)
-                .setSmallIcon(R.drawable.ic_leak_add_white_24dp)
-                .setContentTitle(getString(R.string.broadcast_notif))
-                .setContentText(mDisplayUrl)
-                .setOngoing(true)
-                .addAction(android.R.drawable.ic_menu_close_clear_cancel,
-                    getString(R.string.stop), pIntent);
-        mBuilder.setContentIntent(resultPendingIntent);
-
-        NotificationManager mNotificationManager = (NotificationManager) getSystemService(
-            Context.NOTIFICATION_SERVICE);
-        mNotificationManager.notify(BROADCASTING_NOTIFICATION_ID, mBuilder.build());
     }
 
     protected BroadcastReceiver stopServiceReceiver = new BroadcastReceiver() {

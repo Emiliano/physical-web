@@ -15,14 +15,19 @@
  */
 package org.physical_web.collection;
 
+import org.apache.commons.codec.binary.Base64;
+
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -35,12 +40,14 @@ public class PhysicalWebCollection {
   private static final String SCHEMA_VERSION_KEY = "schema";
   private static final String DEVICES_KEY = "devices";
   private static final String METADATA_KEY = "metadata";
+  private static final String ICON_MAP_KEY = "iconmap";
   private PwsClient mPwsClient;
   private Map<String, UrlDevice> mDeviceIdToUrlDeviceMap;
   private Map<String, PwsResult> mBroadcastUrlToPwsResultMap;
   private Map<String, byte[]> mIconUrlToIconMap;
   private Set<String> mPendingBroadcastUrls;
   private Set<String> mPendingIconUrls;
+  private Set<String> mFailedResolveUrls;
 
   /**
    * Construct a PhysicalWebCollection.
@@ -52,14 +59,26 @@ public class PhysicalWebCollection {
     mIconUrlToIconMap = new HashMap<>();
     mPendingBroadcastUrls = new HashSet<>();
     mPendingIconUrls = new HashSet<>();
+    mFailedResolveUrls = new HashSet<>();
   }
 
   /**
    * Add a UrlDevice to the collection.
    * @param urlDevice The UrlDevice to add.
+   * @return true if the device already existed in the map
    */
-  public void addUrlDevice(UrlDevice urlDevice) {
+  public boolean addUrlDevice(UrlDevice urlDevice) {
+    boolean alreadyFound = mDeviceIdToUrlDeviceMap.containsKey(urlDevice.getId());
     mDeviceIdToUrlDeviceMap.put(urlDevice.getId(), urlDevice);
+    return alreadyFound;
+  }
+
+  /**
+   * Remove a UrlDevice from the collection.
+   * @param urlDevice The UrlDevice to remove.
+   */
+  public void removeUrlDevice(UrlDevice urlDevice) {
+    mDeviceIdToUrlDeviceMap.remove(urlDevice.getId());
   }
 
   /**
@@ -77,6 +96,18 @@ public class PhysicalWebCollection {
    */
   public void addIcon(String url, byte[] icon) {
     mIconUrlToIconMap.put(url, icon);
+  }
+
+  /**
+   * Clear results and devices.
+   */
+  public void clear(){
+    mDeviceIdToUrlDeviceMap.clear();
+    mBroadcastUrlToPwsResultMap.clear();
+    mIconUrlToIconMap.clear();
+    mPendingBroadcastUrls.clear();
+    mPendingIconUrls.clear();
+    mFailedResolveUrls.clear();
   }
 
   /**
@@ -107,6 +138,14 @@ public class PhysicalWebCollection {
   }
 
   /**
+   * Gets all UrlDevices stored in the collection.
+   * @return List of UrlDevices
+   */
+  public List<UrlDevice> getUrlDevices() {
+    return (List) new ArrayList(mDeviceIdToUrlDeviceMap.values());
+  }
+
+  /**
    * Create a JSON object that represents this data structure.
    * @return a JSON serialization of this data structure.
    */
@@ -126,6 +165,13 @@ public class PhysicalWebCollection {
       metadata.put(pwsResult.jsonSerialize());
     }
     jsonObject.put(METADATA_KEY, metadata);
+
+    JSONObject iconMap = new JSONObject();
+    for (String iconUrl : mIconUrlToIconMap.keySet()) {
+      iconMap.put(iconUrl, new String(Base64.encodeBase64(getIcon(iconUrl)),
+          Charset.forName("UTF-8")));
+    }
+    jsonObject.put(ICON_MAP_KEY, iconMap);
 
     jsonObject.put(SCHEMA_VERSION_KEY, SCHEMA_VERSION);
     return jsonObject;
@@ -164,6 +210,12 @@ public class PhysicalWebCollection {
       collection.addMetadata(pwsResult);
     }
 
+    JSONObject iconMap = jsonObject.getJSONObject(ICON_MAP_KEY);
+    for (Iterator<String> iconUrls = iconMap.keys(); iconUrls.hasNext();) {
+      String iconUrl = iconUrls.next();
+      collection.addIcon(iconUrl, Base64.decodeBase64(
+          iconMap.getString(iconUrl).getBytes(Charset.forName("UTF-8"))));
+    }
     return collection;
   }
 
@@ -171,14 +223,15 @@ public class PhysicalWebCollection {
    * Return a list of PwPairs sorted by rank in descending order.
    * These PwPairs will be deduplicated by siteUrls (favoring the PwPair with
    * the highest rank).
+   * @param comparator to sort pairs by
    * @return a sorted list of PwPairs.
    */
-  public List<PwPair> getPwPairsSortedByRank() {
+  public List<PwPair> getPwPairsSortedByRank(Comparator<PwPair> comparator) {
     // Get all valid PwPairs.
     List<PwPair> allPwPairs = getPwPairs();
 
     // Sort the list in descending order.
-    Collections.sort(allPwPairs, Collections.reverseOrder());
+    Collections.sort(allPwPairs, comparator);
 
     // Filter the list.
     return removeDuplicateSiteUrls(allPwPairs);
@@ -187,17 +240,18 @@ public class PhysicalWebCollection {
   /**
    * Return a list of PwPairs sorted by rank in descending order, including only the top-ranked
    * pair from each group.
+   * @param comparator to sort pairs by
    * @return a sorted list of PwPairs.
    */
-  public List<PwPair> getGroupedPwPairsSortedByRank() {
+  public List<PwPair> getGroupedPwPairsSortedByRank(Comparator<PwPair> comparator) {
     // Get all valid PwPairs.
     List<PwPair> allPwPairs = getPwPairs();
 
     // Group pairs with the same groupId, keeping only the top-ranked PwPair.
-    List<PwPair> groupedPwPairs = removeDuplicateGroupIds(allPwPairs, null);
+    List<PwPair> groupedPwPairs = removeDuplicateGroupIds(allPwPairs, null, comparator);
 
     // Sort by descending rank.
-    Collections.sort(groupedPwPairs, Collections.reverseOrder());
+    Collections.sort(groupedPwPairs, comparator);
 
     // Remove duplicate site URLs.
     return removeDuplicateSiteUrls(groupedPwPairs);
@@ -207,7 +261,7 @@ public class PhysicalWebCollection {
    * Return a list of all pairs of valid URL devices and corresponding URL metadata.
    * @return list of PwPairs.
    */
-  private List<PwPair> getPwPairs() {
+  public List<PwPair> getPwPairs() {
     List<PwPair> allPwPairs = new ArrayList<>();
     for (UrlDevice urlDevice : mDeviceIdToUrlDeviceMap.values()) {
       PwsResult pwsResult = mBroadcastUrlToPwsResultMap.get(urlDevice.getUrl());
@@ -220,10 +274,12 @@ public class PhysicalWebCollection {
 
   /**
    * Return the top-ranked PwPair for a given group ID.
+   * @param groupId
+   * @param comparator to sort pairs by
    * @return a PwPair.
    */
-  public PwPair getTopRankedPwPairByGroupId(String groupId) {
-    for (PwPair pwPair : getGroupedPwPairsSortedByRank()) {
+  public PwPair getTopRankedPwPairByGroupId(String groupId, Comparator<PwPair> comparator) {
+    for (PwPair pwPair : getGroupedPwPairsSortedByRank(comparator)) {
       if (pwPair.getPwsResult().getGroupId().equals(groupId)) {
         return pwPair;
       }
@@ -257,7 +313,7 @@ public class PhysicalWebCollection {
    * @return Filtered PwPairs list.
    */
   private static List<PwPair> removeDuplicateGroupIds(List<PwPair> allPairs,
-                                                      Map<String, UrlGroup> outGroupMap) {
+      Map<String, UrlGroup> outGroupMap, Comparator<PwPair> comparator) {
     List<PwPair> filteredPairs = new ArrayList<>();
     Map<String, UrlGroup> groupMap = outGroupMap;
     if (groupMap == null) {
@@ -284,7 +340,7 @@ public class PhysicalWebCollection {
     }
 
     for (UrlGroup urlGroup : groupMap.values()) {
-      filteredPairs.add(urlGroup.getTopPair());
+      filteredPairs.add(urlGroup.getTopPair(comparator));
     }
 
     return filteredPairs;
@@ -348,7 +404,7 @@ public class PhysicalWebCollection {
     Set<String> newIconUrls = new HashSet<>();
     for (UrlDevice urlDevice : mDeviceIdToUrlDeviceMap.values()) {
       String url = urlDevice.getUrl();
-      if (!mPendingBroadcastUrls.contains(url)) {
+      if (!mPendingBroadcastUrls.contains(url) && !mFailedResolveUrls.contains(url)) {
         PwsResult pwsResult = mBroadcastUrlToPwsResultMap.get(url);
         if (pwsResult == null) {
           newResolveUrls.add(url);
@@ -378,6 +434,7 @@ public class PhysicalWebCollection {
 
       @Override
       public void onPwsResultAbsent(String url) {
+        mFailedResolveUrls.add(url);
         pwsResultCallback.onPwsResultAbsent(url);
       }
 

@@ -21,6 +21,7 @@ import org.junit.Before;
 import org.junit.Test;
 
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
@@ -30,6 +31,12 @@ import java.util.concurrent.TimeUnit;
  */
 public class IntegrationTest {
   private PhysicalWebCollection physicalWebCollection;
+  private static Comparator<PwPair> testComparator = new Comparator<PwPair>() {
+    @Override
+    public int compare(PwPair lhs, PwPair rhs) {
+      return lhs.getUrlDevice().getId().compareTo(rhs.getUrlDevice().getId());
+    }
+  };
 
   private class FetchPwsResultsTask {
     private int mNumExpected;
@@ -114,12 +121,12 @@ public class IntegrationTest {
 
   @Test
   public void resolveSomeUrls() throws InterruptedException {
-    physicalWebCollection.addUrlDevice(new RankedDevice("id1", "https://google.com", .5));
-    physicalWebCollection.addUrlDevice(new RankedDevice("id2", "https://goo.gl/mo6YnG", .2));
+    physicalWebCollection.addUrlDevice(new UrlDevice("id1", "https://google.com"));
+    physicalWebCollection.addUrlDevice(new UrlDevice("id2", "https://goo.gl/mo6YnG"));
     FetchPwsResultsTask task = new FetchPwsResultsTask(4);
     assertTrue(task.run());
     assertNull(task.getException());
-    List<PwPair> pwPairs = physicalWebCollection.getPwPairsSortedByRank();
+    List<PwPair> pwPairs = physicalWebCollection.getPwPairsSortedByRank(testComparator);
     assertEquals(2, pwPairs.size());
     assertEquals("https://www.google.com/", pwPairs.get(0).getPwsResult().getSiteUrl());
     assertEquals("https://github.com/google/physical-web",

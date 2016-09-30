@@ -20,10 +20,13 @@ import android.annotation.TargetApi;
 import android.app.Activity;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothManager;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
+import android.net.Uri;
 import android.os.Build;
-import android.util.Log;
+import android.os.Bundle;
 import android.util.Patterns;
 import android.widget.Toast;
 
@@ -31,16 +34,21 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.regex.Matcher;
 
-
 /**
  * This is the main entry point for the broadcasting service.
  * Handles the share intent.
  */
 public class BroadcastActivity extends Activity {
 
-    private static final String TAG  = "BroadcastActivity";
+    private static final String TAG  = BroadcastActivity.class.getSimpleName();
     private static final int ENABLE_BLUETOOTH_REQUEST_ID = 1;
     public static final int MAX_URI_LENGTH = 18;
+    private final BroadcastReceiver serverStartReceiver = new BroadcastReceiver() {
+      @Override
+      public void onReceive(Context context, Intent intent) {
+        finish();
+      }
+    };
 
     @Override
     protected void onActivityResult (int requestCode, int resultCode, Intent data) {
@@ -54,23 +62,46 @@ public class BroadcastActivity extends Activity {
     }
 
     @Override
+    public void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        registerReceiver(serverStartReceiver, new IntentFilter("server"));
+    }
+
+    @Override
+    protected void onDestroy() {
+        unregisterReceiver(serverStartReceiver);
+        super.onDestroy();
+    }
+
+    @Override
     protected void onStart() {
         super.onStart();
-        if (Build.VERSION.SDK_INT < 21){
-            Toast.makeText(this, getString(R.string.ble_os_error),
-                Toast.LENGTH_LONG).show();
-            return;
-        }
-        if (!checkIfBluetoothIsEnabled()) {
-            Intent enableBtIntent = new Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE);
-            startActivityForResult(enableBtIntent, ENABLE_BLUETOOTH_REQUEST_ID);
-        } else {
-            checkBleAndStart();
+        Intent intent = getIntent();
+        String type = intent.getType();
+        String text = intent.getStringExtra(Intent.EXTRA_TEXT);
+        if (type.equals("text/plain")) {
+            if (Build.VERSION.SDK_INT < 21) {
+                Toast.makeText(this, getString(R.string.ble_os_error),
+                    Toast.LENGTH_LONG).show();
+                return;
+            }
+            if (!checkIfBluetoothIsEnabled()) {
+                Intent enableBtIntent = new Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE);
+                startActivityForResult(enableBtIntent, ENABLE_BLUETOOTH_REQUEST_ID);
+            } else {
+                checkBleAndStart();
+            }
+        } else if (type.startsWith("image/") || type.startsWith("text/html") ||
+            type.startsWith("video") || type.startsWith("audio")) {
+            Log.d(TAG, type);
+            Uri fileUri = intent.getParcelableExtra(Intent.EXTRA_STREAM);
+            Log.d(TAG, fileUri.toString());
+            startFileBroadcastService(fileUri.toString(), type);
         }
     }
 
-    private void checkBleAndStart(){
-        if (hasBleAdvertiseCapability()){
+    private void checkBleAndStart() {
+        if (hasBleAdvertiseCapability()) {
             parseAndHandleUrl();
         } else {
             Toast.makeText(this, getString(R.string.ble_error),
@@ -106,7 +137,7 @@ public class BroadcastActivity extends Activity {
         return true;
     }
 
-    private void parseAndHandleUrl(){
+    private void parseAndHandleUrl() {
         Intent intent = getIntent();
         String action = intent.getAction();
         String type = intent.getType();
@@ -122,9 +153,16 @@ public class BroadcastActivity extends Activity {
         }
     }
 
-    private void startBroadcastService(String url){
+    private void startBroadcastService(String url) {
         Intent intent = new Intent(this, PhysicalWebBroadcastService.class);
         intent.putExtra(PhysicalWebBroadcastService.DISPLAY_URL_KEY, url);
+        startService(intent);
+    }
+
+    private void startFileBroadcastService(String uri, String type) {
+        Intent intent = new Intent(this, FileBroadcastService.class);
+        intent.putExtra(FileBroadcastService.FILE_KEY, uri);
+        intent.putExtra(FileBroadcastService.MIME_TYPE_KEY, type);
         startService(intent);
     }
 
@@ -139,7 +177,6 @@ public class BroadcastActivity extends Activity {
         if (urls.size() > 0) {
             return urls.get(0);
         }
-
         return null;
     }
 }

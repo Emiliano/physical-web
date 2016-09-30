@@ -21,28 +21,27 @@ import org.physical_web.collection.PwPair;
 import org.physical_web.collection.PwsResult;
 import org.physical_web.collection.UrlDevice;
 
-import android.animation.Animator;
-import android.animation.Animator.AnimatorListener;
-import android.animation.ObjectAnimator;
 import android.annotation.SuppressLint;
 import android.app.ListFragment;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.ServiceConnection;
+import android.graphics.PorterDuff;
 import android.graphics.drawable.AnimationDrawable;
+import android.net.wifi.WifiInfo;
+import android.net.wifi.WifiManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
-import android.util.Log;
+import android.support.v4.content.ContextCompat;
 import android.view.LayoutInflater;
 import android.view.Menu;
 import android.view.View;
 import android.view.ViewGroup;
-import android.view.animation.DecelerateInterpolator;
-import android.widget.AdapterView;
 import android.widget.BaseAdapter;
+import android.widget.Button;
 import android.widget.ImageView;
 import android.widget.ListView;
 import android.widget.TextView;
@@ -67,7 +66,7 @@ public class NearbyBeaconsFragment extends ListFragment
                                    implements UrlDeviceDiscoveryService.UrlDeviceDiscoveryListener,
                                               SwipeRefreshWidget.OnRefreshListener {
 
-  private static final String TAG = "NearbyBeaconsFragment";
+  private static final String TAG = NearbyBeaconsFragment.class.getSimpleName();
   private static final long FIRST_SCAN_TIME_MILLIS = TimeUnit.SECONDS.toMillis(2);
   private static final long SECOND_SCAN_TIME_MILLIS = TimeUnit.SECONDS.toMillis(5);
   private static final long THIRD_SCAN_TIME_MILLIS = TimeUnit.SECONDS.toMillis(10);
@@ -78,8 +77,13 @@ public class NearbyBeaconsFragment extends ListFragment
   private Handler mHandler;
   private NearbyBeaconsAdapter mNearbyDeviceAdapter;
   private SwipeRefreshWidget mSwipeRefreshWidget;
-  private boolean mDebugViewEnabled = false;
   private boolean mSecondScanComplete;
+  private boolean mFirstTime;
+  private DiscoveryServiceConnection mDiscoveryServiceConnection;
+  private boolean mMissedEmptyGroupIdQueue = false;
+  private SwipeDismissListViewTouchListener mTouchListener;
+  private WifiDirectConnect mWifiDirectConnect;
+  private BluetoothSite mBluetoothSite;
 
   // The display of gathered urls happens as follows
   // 0. Begin scan
@@ -95,7 +99,8 @@ public class NearbyBeaconsFragment extends ListFragment
       Log.d(TAG, "running first scan timeout");
       if (!mGroupIdQueue.isEmpty()) {
         emptyGroupIdQueue();
-        showListView();
+        mSwipeRefreshWidget.setRefreshing(false);
+        mScanningAnimationDrawable.stop();
       }
     }
   };
@@ -106,8 +111,14 @@ public class NearbyBeaconsFragment extends ListFragment
     public void run() {
       Log.d(TAG, "running second scan timeout");
       emptyGroupIdQueue();
-      showListView();
       mSecondScanComplete = true;
+      mSwipeRefreshWidget.setRefreshing(false);
+      mScanningAnimationDrawable.stop();
+      if (mNearbyDeviceAdapter.getCount() == 0) {
+        int tintColor = ContextCompat.getColor(getActivity(), R.color.physical_web_logo);
+        mScanningAnimationDrawable.setColorFilter(tintColor, PorterDuff.Mode.SRC_IN);
+        mScanningAnimationTextView.setText(R.string.empty_nearby_beacons_list_text_no_results);
+      }
     }
   };
 
@@ -117,15 +128,6 @@ public class NearbyBeaconsFragment extends ListFragment
     public void run() {
       Log.d(TAG, "running third scan timeout");
       mDiscoveryServiceConnection.disconnect();
-    }
-  };
-
-  private AdapterView.OnItemLongClickListener mAdapterViewItemLongClickListener =
-      new AdapterView.OnItemLongClickListener() {
-    public boolean onItemLongClick(AdapterView<?> av, View v, int position, long id) {
-      mDebugViewEnabled = !mDebugViewEnabled;
-      mNearbyDeviceAdapter.notifyDataSetChanged();
-      return true;
     }
   };
 
@@ -149,6 +151,8 @@ public class NearbyBeaconsFragment extends ListFragment
         mDiscoveryService.restartScan();
       }
       mPwCollection = mDiscoveryService.getPwCollection();
+      // Make sure cached results get placed in the mGroupIdQueue.
+      onUrlDeviceDiscoveryUpdate();
       startScanningDisplay(mDiscoveryService.getScanStartTime(), mDiscoveryService.hasResults());
     }
 
@@ -181,11 +185,6 @@ public class NearbyBeaconsFragment extends ListFragment
       stopScanningDisplay();
     }
   }
-  private DiscoveryServiceConnection mDiscoveryServiceConnection = new DiscoveryServiceConnection();
-
-  public static NearbyBeaconsFragment newInstance() {
-    return new NearbyBeaconsFragment();
-  }
 
   private void initialize(View rootView) {
     setHasOptionsMenu(true);
@@ -205,11 +204,41 @@ public class NearbyBeaconsFragment extends ListFragment
     mScanningAnimationDrawable =
         (AnimationDrawable) mScanningAnimationTextView.getCompoundDrawables()[1];
     ListView listView = (ListView) rootView.findViewById(android.R.id.list);
-    listView.setOnItemLongClickListener(mAdapterViewItemLongClickListener);
+    mDiscoveryServiceConnection = new DiscoveryServiceConnection();
+    mWifiDirectConnect = new WifiDirectConnect(getActivity());
+    mBluetoothSite = new BluetoothSite(getActivity());
+    mTouchListener =
+      new SwipeDismissListViewTouchListener(
+              listView,
+              new SwipeDismissListViewTouchListener.DismissCallbacks() {
+                  @Override
+                  public boolean canDismiss(int position) {
+                      return true;
+                  }
+
+                  @Override
+                  public void onDismiss(ListView listView, int position) {
+                    Utils.addBlocked(mNearbyDeviceAdapter.getItem(position));
+                    Utils.saveBlocked(getActivity());
+                    if (mMissedEmptyGroupIdQueue) {
+                      mMissedEmptyGroupIdQueue = false;
+                      emptyGroupIdQueue();
+                    }
+                  }
+              });
+    listView.setOnTouchListener(mTouchListener);
+
+    // Setting this scroll listener is required to ensure that during ListView scrolling,
+    // we don't look for swipes.
+    listView.setOnScrollListener(mTouchListener.makeScrollListener());
+    Utils.restoreFavorites(getActivity());
+    Utils.restoreBlocked(getActivity());
   }
 
+  @Override
   public View onCreateView(LayoutInflater layoutInflater, ViewGroup container,
                            Bundle savedInstanceState) {
+    mFirstTime = true;
     View rootView = layoutInflater.inflate(R.layout.fragment_nearby_beacons, container, false);
     initialize(rootView);
     return rootView;
@@ -220,8 +249,16 @@ public class NearbyBeaconsFragment extends ListFragment
     super.onResume();
     getActivity().getActionBar().setTitle(R.string.title_nearby_beacons);
     getActivity().getActionBar().setDisplayHomeAsUpEnabled(false);
-    getListView().setVisibility(View.INVISIBLE);
-    mDiscoveryServiceConnection.connect(true);
+    if (mFirstTime && !PermissionCheck.getInstance().isCheckingPermissions()) {
+      restartScan();
+    }
+    mFirstTime = false;
+  }
+
+  public void restartScan() {
+    if (mDiscoveryServiceConnection != null) {
+      mDiscoveryServiceConnection.connect(true);
+    }
   }
 
   @Override
@@ -233,40 +270,62 @@ public class NearbyBeaconsFragment extends ListFragment
   @Override
   public void onPrepareOptionsMenu(Menu menu) {
     super.onPrepareOptionsMenu(menu);
-    menu.findItem(R.id.action_config).setVisible(true);
     menu.findItem(R.id.action_about).setVisible(true);
   }
 
   @Override
   public void onListItemClick(ListView l, View v, int position, long id) {
-    // If we are scanning
-    if (mScanningAnimationDrawable.isRunning()) {
+    PwPair item = mNearbyDeviceAdapter.getItem(position);
+    // If we are scanning or user clicked on folder
+    if (mScanningAnimationDrawable.isRunning() || isFolderItem(item)) {
       // Don't respond to touch events
       return;
     }
     // Get the url for the given item
-    PwPair pwPair = mNearbyDeviceAdapter.getItem(position);
-    Intent intent = Utils.createNavigateToUrlIntent(pwPair.getPwsResult());
-    startActivity(intent);
+    PwsResult pwsResult = item.getPwsResult();
+    if (Utils.isWifiDirectDevice(item.getUrlDevice())) {
+      // Initiate WifiDirect Connection request to device
+      mWifiDirectConnect.connect(item.getUrlDevice(), pwsResult.getTitle());
+    } else if (Utils.isFatBeaconDevice(item.getUrlDevice())) {
+      if (!mBluetoothSite.isRunning()) {
+        mBluetoothSite.connect(pwsResult.getSiteUrl(), pwsResult.getTitle());
+      }
+    } else {
+      Intent intent = Utils.createNavigateToUrlIntent(pwsResult);
+      startActivity(intent);
+    }
   }
 
   @Override
   public void onUrlDeviceDiscoveryUpdate() {
-    for (PwPair pwPair : mPwCollection.getGroupedPwPairsSortedByRank()) {
-      String groupId = Utils.getGroupId(pwPair.getPwsResult());
-      Log.d(TAG, "groupid to add " + groupId);
-      if (mNearbyDeviceAdapter.containsGroupId(groupId)) {
-        mNearbyDeviceAdapter.updateItem(pwPair);
-      } else if (!mGroupIdQueue.contains(groupId)) {
-        mGroupIdQueue.add(groupId);
-        if (mSecondScanComplete) {
-          // If we've already waited for the second scan timeout, go ahead and put the item in the
-          // listview.
-          emptyGroupIdQueue();
+    // Since this callback is given on a background thread and we want
+    // to update the list adapter (which can only be done on the UI thread)
+    // we have to interact with the adapter on the UI thread.
+    new Handler(Looper.getMainLooper()).post(new Runnable() {
+      @Override
+      public void run() {
+        if (SwipeDismissListViewTouchListener.isLocked()) {
+          return;
         }
+        for (PwPair pwPair : mPwCollection.getGroupedPwPairsSortedByRank(
+            new Utils.PwPairRelevanceComparator())) {
+          String groupId = Utils.getGroupId(pwPair.getPwsResult());
+          Log.d(TAG, "groupid to add " + groupId);
+          if (mNearbyDeviceAdapter.containsGroupId(groupId)) {
+            mNearbyDeviceAdapter.updateItem(pwPair);
+          } else if (!mGroupIdQueue.contains(groupId)
+              && !Utils.isBlocked(pwPair)) {
+            mGroupIdQueue.add(groupId);
+            if (mSecondScanComplete) {
+              // If we've already waited for the second scan timeout,
+              // go ahead and put the item in the listview.
+              emptyGroupIdQueue();
+            }
+          }
+        }
+        mNearbyDeviceAdapter.notifyDataSetChanged();
       }
-    }
-    safeNotifyChange();
+    });
   }
 
   private void stopScanningDisplay() {
@@ -287,20 +346,20 @@ public class NearbyBeaconsFragment extends ListFragment
     long elapsedMillis = new Date().getTime() - scanStartTime;
     if (elapsedMillis < FIRST_SCAN_TIME_MILLIS
         || (elapsedMillis < SECOND_SCAN_TIME_MILLIS && !hasResults)) {
-      mScanningAnimationTextView.setAlpha(1f);
+      mNearbyDeviceAdapter.clear();
+      mScanningAnimationDrawable.setColorFilter(null);
+      mScanningAnimationTextView.setText(R.string.empty_nearby_beacons_list_text);
       mScanningAnimationDrawable.start();
-      getListView().setVisibility(View.INVISIBLE);
     } else {
-      showListView();
+      mSwipeRefreshWidget.setRefreshing(false);
+      mScanningAnimationDrawable.stop();
     }
 
     // Schedule the timeouts
-    // We delay at least 50 milliseconds to give the discovery service a chance to
-    // give us cached results.
     mSecondScanComplete = false;
-    long firstDelay = Math.max(FIRST_SCAN_TIME_MILLIS - elapsedMillis, 50);
-    long secondDelay = Math.max(SECOND_SCAN_TIME_MILLIS - elapsedMillis, 50);
-    long thirdDelay = Math.max(THIRD_SCAN_TIME_MILLIS - elapsedMillis, 50);
+    long firstDelay = Math.max(FIRST_SCAN_TIME_MILLIS - elapsedMillis, 0);
+    long secondDelay = Math.max(SECOND_SCAN_TIME_MILLIS - elapsedMillis, 0);
+    long thirdDelay = Math.max(THIRD_SCAN_TIME_MILLIS - elapsedMillis, 0);
     mHandler.postDelayed(mFirstScanTimeout, firstDelay);
     mHandler.postDelayed(mSecondScanTimeout, secondDelay);
     mHandler.postDelayed(mThirdScanTimeout, thirdDelay);
@@ -319,82 +378,61 @@ public class NearbyBeaconsFragment extends ListFragment
   }
 
   private void emptyGroupIdQueue() {
+    if (SwipeDismissListViewTouchListener.isLocked()) {
+      mMissedEmptyGroupIdQueue = true;
+      return;
+    }
+
     List<PwPair> pwPairs = new ArrayList<>();
+
     for (String groupId : mGroupIdQueue) {
       Log.d(TAG, "groupid " + groupId);
       pwPairs.add(Utils.getTopRankedPwPairByGroupId(mPwCollection, groupId));
     }
-    Collections.sort(pwPairs, Collections.reverseOrder());
+    Collections.sort(pwPairs, new Utils.PwPairRelevanceComparator());
     for (PwPair pwPair : pwPairs) {
       mNearbyDeviceAdapter.addItem(pwPair);
     }
     mGroupIdQueue.clear();
-    safeNotifyChange();
+    mNearbyDeviceAdapter.notifyDataSetChanged();
   }
 
-  private void showListView() {
-    if (getListView().getVisibility() == View.VISIBLE) {
-      return;
-    }
-
-    mSwipeRefreshWidget.setRefreshing(false);
-    getListView().setAlpha(0f);
-    getListView().setVisibility(View.VISIBLE);
-    safeNotifyChange();
-    ObjectAnimator alphaAnimation = ObjectAnimator.ofFloat(getListView(), "alpha", 0f, 1f);
-    alphaAnimation.setDuration(400);
-    alphaAnimation.setInterpolator(new DecelerateInterpolator());
-    alphaAnimation.addListener(new AnimatorListener() {
-      @Override
-      public void onAnimationStart(Animator animation) {
-      }
-      @Override
-      public void onAnimationEnd(Animator animation) {
-        mScanningAnimationTextView.setAlpha(0f);
-        mScanningAnimationDrawable.stop();
-      }
-      @Override
-      public void onAnimationRepeat(Animator animation) {
-      }
-      @Override
-      public void onAnimationCancel(Animator animation) {
-      }
-    });
-    alphaAnimation.start();
-  }
-
-  /**
-   * Notify the view that the underlying data has been changed.
-   *
-   * We need to make sure the view is visible because if it's not,
-   * the view will become visible when we notify it.
-   */
-  private void safeNotifyChange() {
-    if (getListView().getVisibility() == View.VISIBLE) {
-      new Handler(Looper.getMainLooper()).post(new Runnable() {
-        @Override
-        public void run() {
-          mNearbyDeviceAdapter.notifyDataSetChanged();
-        }
-      });
-    }
+  private static boolean isFolderItem(PwPair item) {
+    return item.getUrlDevice() == null && item.getPwsResult().getSiteUrl() == null;
   }
 
   // Adapter for holding beacons found through scanning.
   private class NearbyBeaconsAdapter extends BaseAdapter {
     private List<PwPair> mPwPairs;
+    private int mNumberOfHideableResults;
 
     NearbyBeaconsAdapter() {
       mPwPairs = new ArrayList<>();
+      mNumberOfHideableResults = 0;
     }
 
     public void addItem(PwPair pwPair) {
+      // If isResolvableDevice place in the folder at the bottom
+      // of the list (making the folder if it didn't already exist)
+      // Otherwise place in the bottom of the non-folder list
+      if (Utils.isResolvableDevice(pwPair.getUrlDevice())) {
+        mPwPairs.add(mPwPairs.size() - mNumberOfHideableResults, pwPair);
+        return;
+      }
+      if (mNumberOfHideableResults == 0) {
+        mPwPairs.add(new PwPair(null, new PwsResult(null, null)));
+        mNumberOfHideableResults++;
+      }
+      mNumberOfHideableResults++;
       mPwPairs.add(pwPair);
     }
 
     public void updateItem(PwPair pwPair) {
       String groupId = Utils.getGroupId(pwPair.getPwsResult());
       for (int i = 0; i < mPwPairs.size(); ++i) {
+        if (isFolderItem(mPwPairs.get(i))) {
+          continue;
+        }
         if (Utils.getGroupId(mPwPairs.get(i).getPwsResult()).equals(groupId)) {
           mPwPairs.set(i, pwPair);
           return;
@@ -405,6 +443,9 @@ public class NearbyBeaconsFragment extends ListFragment
 
     public boolean containsGroupId(String groupId) {
       for (PwPair pwPair : mPwPairs) {
+        if (isFolderItem(pwPair)) {
+          continue;
+        }
         if (Utils.getGroupId(pwPair.getPwsResult()).equals(groupId)) {
           return true;
         }
@@ -434,36 +475,76 @@ public class NearbyBeaconsFragment extends ListFragment
     @SuppressLint("InflateParams")
     @Override
     public View getView(int i, View view, ViewGroup viewGroup) {
-      // Get the list view item for the given position
-      if (view == null) {
-        view = getActivity().getLayoutInflater().inflate(R.layout.list_item_nearby_beacon,
-                                                         viewGroup, false);
-      }
-
       // Display the pwsResult.
       PwPair pwPair = getItem(i);
       PwsResult pwsResult = pwPair.getPwsResult();
+      if (isFolderItem(pwPair)) {
+        view = getActivity().getLayoutInflater().inflate(R.layout.folder_item_nearby_beacon,
+            viewGroup, false);
+        WifiManager wifiManager = (WifiManager) getActivity().
+            getSystemService(Context.WIFI_SERVICE);
+        WifiInfo wifiInfo = wifiManager.getConnectionInfo();
+        String ssid = wifiInfo.getSSID().trim();
+        if (ssid.charAt(0) == '"' && ssid.charAt(ssid.length() - 1) == '"') {
+          setText(view, R.id.title, ssid.substring(1, ssid.length() - 1));
+        } else {
+          setText(view, R.id.title, "Wireless Network");
+        }
+        return view;
+      }
+      view = getActivity().getLayoutInflater().inflate(R.layout.list_item_nearby_beacon,
+          viewGroup, false);
       setText(view, R.id.title, pwsResult.getTitle());
-      setText(view, R.id.url, pwsResult.getSiteUrl());
+      if (Utils.isFatBeaconDevice(pwPair.getUrlDevice())) {
+        setText(view, R.id.url, getString(R.string.FatBeacon_URL) + pwsResult.getSiteUrl());
+      } else {
+        setText(view, R.id.url, pwsResult.getSiteUrl());
+      }
+      if (Utils.isResolvableDevice(pwPair.getUrlDevice())) {
+        ((ImageView) view.findViewById(R.id.icon)).setImageBitmap(
+            Utils.getBitmapIcon(mPwCollection, pwsResult));
+      } else {
+        ((ImageView) view.findViewById(R.id.icon))
+            .setImageResource(R.drawable.unresolved_result_icon);
+      }
       setText(view, R.id.description, pwsResult.getDescription());
-      ((ImageView) view.findViewById(R.id.icon)).setImageBitmap(
-          Utils.getBitmapIcon(mPwCollection, pwsResult));
+      final String siteUrl = pwsResult.getSiteUrl();
 
-      if (mDebugViewEnabled) {
+      if (Utils.isFavorite(siteUrl)) {
+        ((Button) view.findViewById(R.id.star)).setBackgroundResource(
+            R.drawable.ic_star_black_24dp);
+        ((Button) view.findViewById(R.id.star)).setOnClickListener(new View.OnClickListener() {
+          @Override
+          public void onClick(View v) {
+            Utils.toggleFavorite(siteUrl);
+            Utils.saveFavorites(getActivity());
+            ((Button) v).setBackgroundResource(R.drawable.ic_star_border_black_24dp);
+            notifyDataSetChanged();
+          }
+        });
+      } else {
+        ((Button) view.findViewById(R.id.star)).setBackgroundResource(
+            R.drawable.ic_star_border_black_24dp);
+        ((Button) view.findViewById(R.id.star)).setOnClickListener(new View.OnClickListener() {
+          @Override
+          public void onClick(View v) {
+            Utils.toggleFavorite(siteUrl);
+            Utils.saveFavorites(getActivity());
+            ((Button) v).setBackgroundResource(R.drawable.ic_star_black_24dp);
+            notifyDataSetChanged();
+          }
+        });
+      }
+
+      if (Utils.isDebugViewEnabled(getActivity())) {
         // If we should show the ranging data
         updateDebugView(pwPair, view);
         view.findViewById(R.id.ranging_debug_container).setVisibility(View.VISIBLE);
         view.findViewById(R.id.metadata_debug_container).setVisibility(View.VISIBLE);
-        mPwCollection.setPwsEndpoint(Utils.DEV_ENDPOINT, Utils.DEV_ENDPOINT_VERSION);
-        UrlShortenerClient.getInstance(getActivity()).setEndpoint(Utils.DEV_ENDPOINT);
       } else {
-        // Otherwise ensure it is not shown
         view.findViewById(R.id.ranging_debug_container).setVisibility(View.GONE);
         view.findViewById(R.id.metadata_debug_container).setVisibility(View.GONE);
-        Utils.setPwsEndpoint(getActivity(), mPwCollection);
-        UrlShortenerClient.getInstance(getActivity()).setEndpoint(Utils.PROD_ENDPOINT);
       }
-
       return view;
     }
 
@@ -496,15 +577,19 @@ public class NearbyBeaconsFragment extends ListFragment
       setText(view, R.id.metadata_debug_rank,
           getString(R.string.metadata_debug_rank_prefix)
           + new DecimalFormat("##.##").format(0));  // We currently do not use rank.
-      setText(view, R.id.metadata_debug_pws_trip_time,
-          getString(R.string.metadata_debug_pws_trip_time_prefix)
-          + new DecimalFormat("##.##s").format(Utils.getPwsTripTimeMillis(pwsResult) / 1000.0));
+      if (Utils.isResolvableDevice(urlDevice)) {
+        setText(view, R.id.metadata_debug_pws_trip_time,
+            getString(R.string.metadata_debug_pws_trip_time_prefix)
+                + new DecimalFormat("##.##s")
+                .format(Utils.getPwsTripTimeMillis(pwsResult) / 1000.0));
+      }
       setText(view, R.id.metadata_debug_groupid,
           getString(R.string.metadata_debug_groupid_prefix) + Utils.getGroupId(pwsResult));
     }
 
     public void clear() {
       mPwPairs.clear();
+      mNumberOfHideableResults = 0;
       notifyDataSetChanged();
     }
   }
